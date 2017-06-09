@@ -1,0 +1,139 @@
+{***********************************<_INFO>************************************}
+{  <Проект>      Медиа-сервер                                                  }
+{                                                                              }
+{  <Область>     16:Медиа-контроль                                             }
+{                                                                              }
+{  <Задача>      Медиа-источник, предоставляющий данные с Web-камеры           }
+{                                                                              }
+{  <Автор>       Фадеев Р.В.                                                   }
+{                                                                              }
+{  <Дата>        14.01.2011                                                    }
+{                                                                              }
+{  <Примечание>  Нет примечаний.                                               }
+{                                                                              }
+{  <Атрибуты>    ООО НПП "Спецстрой-Связь", ООО "Трисофт"                      }
+{                                                                              }
+{***********************************</_INFO>***********************************}
+unit MediaServer.Stream.Source.WebCamera;
+
+interface
+  uses Windows, SysUtils, SyncObjs, Classes, ExtCtrls,
+  MediaServer.Stream.Source,
+  MediaProcessing.Definitions;
+
+type
+  //Класс, выполняющий непосредственно получение данных (видеопотока) из камеры
+  TMediaServerSourceWebCamera = class (TMediaServerSource)
+  private
+    FLock : TCriticalSection;
+
+    FDeviceName: string;
+    FTransmitAudio : boolean; //Записывать ли аудио
+  protected
+    function GetStreamType(aMediaType: TMediaType): TStreamType; override;
+  public
+    constructor Create(const aDeviceName: string;
+                       aTransmitAudio: boolean //Записывать ли аудио
+                       ); overload;
+
+    destructor Destroy; override;
+
+
+    procedure Open(aSync: boolean); override;
+    procedure DoClose(aSync: boolean); override;
+
+    procedure WaitWhileConnecting(aTimeout: integer); override;
+    function  Opened: Boolean; override;
+
+    function Name: string; override;
+    function DeviceType: string; override;
+    function ConnectionString: string; override;
+    function StreamInfo: TBytes; override;
+  end;
+
+implementation
+  uses Math,Forms,MediaServer.Workspace,uTrace;
+
+
+{ TMediaServerSourceWebCamera }
+
+constructor TMediaServerSourceWebCamera.Create(const aDeviceName: string;
+                       aTransmitAudio: boolean //Записывать ли аудио
+                       );
+begin
+  Create(-1);
+
+  FLock:=TCriticalSection.Create;
+  FTransmitAudio:=aTransmitAudio;
+end;
+
+destructor TMediaServerSourceWebCamera.Destroy;
+begin
+  inherited;
+  FreeAndNil(FLock);
+end;
+
+function TMediaServerSourceWebCamera.DeviceType: string;
+begin
+  result:='Web-камера';
+end;
+
+function TMediaServerSourceWebCamera.Name: string;
+begin
+  Result := Format('WebCam %s', [FDeviceName])
+end;
+
+procedure TMediaServerSourceWebCamera.Open(aSync: boolean);
+begin
+  if Opened then
+    exit;
+
+  Close(true);
+
+  {TODO}
+end;
+
+procedure TMediaServerSourceWebCamera.DoClose;
+begin
+  FLock.Enter;
+
+  try
+    {TODO}
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMediaServerSourceWebCamera.ConnectionString: string;
+begin
+  result:=Format('%s:%s',['WebCam',FDeviceName]);
+end;
+
+function TMediaServerSourceWebCamera.Opened: Boolean;
+begin
+  FLock.Enter;
+  try
+    result:=false; {TODO}
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TMediaServerSourceWebCamera.StreamInfo: TBytes;
+begin
+  result:=nil;
+end;
+
+function TMediaServerSourceWebCamera.GetStreamType(aMediaType: TMediaType): TStreamType;
+begin
+  result:=0; //TODO
+end;
+
+
+procedure TMediaServerSourceWebCamera.WaitWhileConnecting(aTimeout: integer);
+begin
+  inherited;
+end;
+
+end.
+

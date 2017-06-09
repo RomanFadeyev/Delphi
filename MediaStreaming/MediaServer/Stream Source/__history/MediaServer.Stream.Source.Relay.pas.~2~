@@ -1,0 +1,174 @@
+{***********************************<_INFO>************************************}
+{  <Проект>      Медиа-сервер                                                  }
+{                                                                              }
+{  <Область>     16:Медиа-контроль                                             }
+{                                                                              }
+{  <Задача>      Медиа-источник, предоставляющий видео-данные путем снимков    }
+{                экрана                                                        }
+{                                                                              }
+{  <Автор>       Фадеев Р.В.                                                   }
+{                                                                              }
+{  <Дата>        14.01.2011                                                    }
+{                                                                              }
+{  <Примечание>  Нет примечаний.                                               }
+{                                                                              }
+{  <Атрибуты>    ООО НПП "Спецстрой-Связь", ООО "Трисофт"                      }
+{                                                                              }
+{***********************************</_INFO>***********************************}
+
+unit MediaServer.Stream.Source.Relay;
+
+interface
+  uses Windows, SysUtils, Classes, SyncObjs,uBaseClasses,
+  MediaServer.Stream.Source,
+  MediaProcessing.Definitions;
+
+type
+  TMediaServerSourceRelay = class;
+  TOpeningEvent = procedure (aSender: TMediaServerSourceRelay) of object;
+
+  TMediaServerSourceRelay = class (TMediaServerSource)
+  private
+    FLastStreamTypes : TAllMediaStreamTypes;
+    FOpened: boolean;
+    FConnectionString: string;
+    FOnOpening: TOpeningEvent;
+    FName: string;
+  protected
+    function GetStreamType(aMediaType: TMediaType): TStreamType; override;
+  public
+    constructor Create(aDataReceiveTimeout: integer); overload;
+    destructor Destroy; override;
+
+    procedure OnFrameReceived(const aFormat: TMediaStreamDataHeader; const aData,aInfo: TBytes);
+
+    procedure Open(aSync: boolean); override;
+    procedure DoClose(aSync: boolean); override;
+
+    procedure WaitWhileConnecting(aTimeout: integer); override;
+    function  Opened: Boolean; override;
+
+    function Name: string; override;
+    function DeviceType: string; override;
+    function ConnectionString: string; override;
+    function StreamInfo: TBytes; override;
+
+    function PtzSupported: boolean; override;
+
+    procedure SetConnectionString(const aString: string);
+    procedure SetName(const aName: string);
+
+    property  OnOpening: TOpeningEvent read FOnOpening write FOnOpening;
+  end;
+
+implementation
+  uses Math,MediaServer.Workspace,uTrace,MediaStream.FramerFactory,ThreadNames,MediaServer.Net.Ms3s.StreamClient;
+
+
+{ TMediaServerSourceRelay }
+
+constructor TMediaServerSourceRelay.Create(
+  aDataReceiveTimeout: integer //таймаут получения данных от канала
+  );
+var
+  i: TMediaType;
+begin
+  inherited Create(aDataReceiveTimeout);
+
+  for i := Low(TMediaType) to High(TMediaType) do
+    FLastStreamTypes[i]:=stUNIV;
+end;
+
+destructor TMediaServerSourceRelay.Destroy;
+begin
+  inherited;
+end;
+
+function TMediaServerSourceRelay.DeviceType: string;
+begin
+  result:='Stream Relay';
+end;
+
+function TMediaServerSourceRelay.Name: string;
+begin
+  result:=FName;
+end;
+
+procedure TMediaServerSourceRelay.OnFrameReceived(const aFormat: TMediaStreamDataHeader; const aData,aInfo: TBytes);
+begin
+//  //Если не нужно записывать аудио данные, то выходим
+//if not FTransmitAudio and (aFormat.biMediaType=mtAudio) then
+//    exit;
+
+  LockStream;
+  try
+    FLastStreamTypes[aFormat.biMediaType]:=aFormat.biStreamType;
+  finally
+    UnlockStream;
+  end;
+
+  DoDataReceived(aFormat, @aData[0],Length(aData),@aInfo[0],Length(aInfo));
+end;
+
+procedure TMediaServerSourceRelay.Open(aSync: boolean);
+begin
+  if Opened then
+    exit;
+
+  Close;
+  if Assigned(FOnOpening) then
+    FOnOpening(self);
+
+  FOpened:=true;
+
+  if Assigned(OnConnectionOk) then
+    OnConnectionOk(self);
+end;
+
+procedure TMediaServerSourceRelay.DoClose;
+begin
+  FOpened:=false;
+end;
+
+function TMediaServerSourceRelay.ConnectionString: string;
+begin
+  result:=FConnectionString;
+end;
+
+function TMediaServerSourceRelay.Opened: Boolean;
+begin
+  result:=FOpened;
+end;
+
+procedure TMediaServerSourceRelay.SetConnectionString(const aString: string);
+begin
+  FConnectionString:=aString;
+end;
+
+procedure TMediaServerSourceRelay.SetName(const aName: string);
+begin
+  FName:=aName;
+end;
+
+function TMediaServerSourceRelay.StreamInfo: TBytes;
+begin
+  result:=nil;
+end;
+
+function TMediaServerSourceRelay.GetStreamType(aMediaType: TMediaType): TStreamType;
+begin
+  result:=FLastStreamTypes[aMediaType];
+end;
+
+function TMediaServerSourceRelay.PtzSupported: boolean;
+begin
+  result:=false;
+end;
+
+procedure TMediaServerSourceRelay.WaitWhileConnecting(aTimeout: integer);
+begin
+  inherited;
+end;
+
+end.
+

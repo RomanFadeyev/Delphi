@@ -1,0 +1,496 @@
+{***********************************<_INFO>************************************}
+{  <Проект>      Медиа-сервер                                                  }
+{                                                                              }
+{  <Область>     16:Медиа-контроль                                             }
+{                                                                              }
+{  <Задача>      Медиа-источник, предоставляющий чтение данных из файла        }
+{                                                                              }
+{  <Автор>       Фадеев Р.В.                                                   }
+{                                                                              }
+{  <Дата>        14.01.2011                                                    }
+{                                                                              }
+{  <Примечание>  Нет примечаний.                                               }
+{                                                                              }
+{  <Атрибуты>    ООО НПП "Спецстрой-Связь", ООО "Трисофт"                      }
+{                                                                              }
+{***********************************</_INFO>***********************************}
+unit MediaServer.Stream.Source.File_;
+
+interface
+  uses Windows, SysUtils, Classes, SyncObjs,uBaseClasses,
+  MediaServer.Stream.Source,
+  MediaProcessing.Definitions,MediaStream.Framer, MediaStream.DataSource.File_;
+
+type
+  TMediaServerSourceFile = class;
+  TFileFinishedEvent = procedure (Sender: TMediaServerSourceFile; const aFileName: string) of object;
+
+  //Класс, выполняющий непосредственно получение данных (видеопотока)
+  TMediaServerSourceFile = class (TMediaServerSourceBasedOnMediaStream)
+  private
+    FFileReadThread : TThreadObjectVar<TThread>;
+    FFileName: string;
+    FTransmitAudio : boolean;
+    FFramerClass: TStreamFramerClass;
+    FOnFileFinished: TFileFinishedEvent;
+  protected
+    function GetStreamType(aMediaType: TMediaType): TStreamType; override;
+  public
+    constructor Create(const aFileName: string;
+                       aTransmitAudio: boolean //Записывать ли аудио
+                      ); overload;
+
+    destructor Destroy; override;
+
+    procedure OnFrameReceived(const aFormat: TMediaStreamDataHeader;
+                              aData: pointer; aDataSize:cardinal;
+                              aInfo: pointer; aInfoSize: cardinal);
+
+    procedure Open(aSync: boolean); override;
+    procedure DoClose; override;
+
+    procedure WaitWhileConnecting(aTimeout: integer); override;
+    function  Opened: Boolean; override;
+
+
+    function Name: string; override;
+    function DeviceType: string; override;
+    function ConnectionString: string; override;
+    function StreamInfo: TBytes; override;
+
+    function PtzSupported: boolean; override;
+
+
+    property OnFileFinished: TFileFinishedEvent read FOnFileFinished write FOnFileFinished;
+    //property Framer: TStreamFramer read FFramer;
+  end;
+
+implementation
+  uses Math,Forms,ThreadNames, VFW, MediaServer.Workspace, uTrace,
+       MediaStream.FramerFactory,MediaStream.UrlFormats;
+
+type
+  TFileReader = class
+  private
+    FFramer: TStreamFramer;
+    FStream : TStream;
+  public
+    constructor Create(const aFileName: string; aFramerClass:TStreamFramerClass);
+    destructor Destroy; override;
+
+    procedure Reset;
+    function  GetNextFrame(out aOutFormat: TMediaStreamDataHeader; out aOutData: pointer; out aOutDataSize: cardinal; out aOutInfo: pointer; out aOutInfoSize: cardinal):boolean;
+
+    function StreamInfo: TBytes;
+    function VideoStreamType: TStreamType;
+    function AudioStreamType: TStreamType;
+  end;
+
+  TReadFileThread = class (TThread)
+  private
+    FOwner: TMediaServerSourceFile;
+    FReader: TFileReader;
+    FOpenLock: TCriticalSection;
+    FVideoTimeStampBase: int64;
+    FAudioTimeStampBase: int64;
+
+    FStreamInfo: TBytes;
+
+    function StreamInfo: TBytes;
+    //function StreamType: TStreamType;
+  protected
+    procedure ProcessFile;
+    procedure Execute; override;
+  public
+    constructor Create(const aFileName:string; aFramerClass:TStreamFramerClass; aOwner: TMediaServerSourceFile);
+    destructor Destroy; override;
+  end;
+
+
+function GetReadThread(aThread : TThreadObjectVar<TThread>): TReadFileThread;
+begin
+  result:=aThread.Value as TReadFileThread;
+  Assert(result<>nil);
+end;
+
+{ TReadFileThread }
+
+constructor TReadFileThread.Create(const aFileName: string; aFramerClass:TStreamFramerClass; aOwner: TMediaServerSourceFile);
+begin
+  FOwner:=aOwner;
+  FOpenLock:=TCriticalSection.Create;
+
+  FReader:=TFileReader.Create(aFileName,aFramerClass);
+  FStreamInfo:=FReader.StreamInfo;
+  inherited Create(false);
+end;
+
+destructor TReadFileThread.Destroy;
+begin
+  inherited;
+  FreeAndNil(FReader);
+  FreeAndNil(FOpenLock);
+end;
+
+procedure TReadFileThread.ProcessFile;
+var
+  aTicks: Cardinal;
+  aDelay : int64;
+
+  aData: pointer;
+  aDataSize: cardinal;
+  aInfo: pointer;
+  aInfoSize: cardinal;
+  aFormat: TMediaStreamDataHeader;
+
+  aStartTicks: cardinal;
+  aCurrentTicks : cardinal;
+  aFirstVideoFrame,aFirstAudioFrame : boolean;
+
+  aFirstVideoFrameTimestampMs,aTimeStampMs,aTimestampDeltaMs: int64;
+  x,aPrevVideoFrameTimestamp, aFirstAudioFrameTimestampMs, aPrevAudioFrameTimestamp: int64;
+begin
+  FOpenLock.Enter;
+  try
+    FReader.Reset;
+    FStreamInfo:=FReader.StreamInfo;
+  finally
+    FOpenLock.Leave;
+  end;
+
+
+  aStartTicks:=GetTickCount;
+  aFirstVideoFrame:=true;
+  aFirstAudioFrame:=true;
+
+  aPrevVideoFrameTimestamp:=-1;
+  aPrevAudioFrameTimestamp:=-1;
+  aFirstVideoFrameTimestampMs:=0;
+  aFirstAudioFrameTimestampMs:=0;
+  //aFirstVideoFrameTimestamp:=0;
+  //aFirstAudioFrameTimestamp:=0;
+  //aLastVideoFrameTimestamp:=0;
+  //aLastAudioFrameTimestamp:=0;
+
+  while not Terminated do
+  begin
+    //----------- Читаем фрейм
+    aFormat.Clear;
+    if not FReader.GetNextFrame(aFormat,aData,aDataSize, aInfo,aInfoSize) then
+      break;
+
+    aTimeStampMs:=aFormat.TimeStamp*aFormat.TimeKoeff;
+
+    //Прежде чем отдать фрейм наружу, посмотрим, сколько нужно подождать от предыдущего фрейма
+    if (aFormat.biMediaType=mtVideo) then
+    begin
+      if (not aFirstVideoFrame) then
+      begin
+        aCurrentTicks:=GetTickCount;
+        if aCurrentTicks<aStartTicks then //Страховка
+          break;
+
+        aTicks:=aCurrentTicks-aStartTicks; //Считаем сколько прошло мс реального времени от момента старта файла
+        aTimestampDeltaMs:=aTimeStampMs-aFirstVideoFrameTimestampMs;
+
+        if (aTimestampDeltaMs>aTicks) and (aTimestampDeltaMs-aTicks>10) then //10 мс оставляем на всякие задержки в процессе передачи
+          aDelay:=aTimestampDeltaMs-aTicks-10 //Вычитаем из расчетного времени реальное время. Дельта - величина, на сколько надо притормозить
+        else
+          aDelay:=0; //Мы не успеваем
+
+        //OutputDebugString(PChar(Format('TimeStamp: %d, Delay:%d',[aTimeStampMs,aDelay])));
+        Assert(aDelay>=0);
+        if aDelay>0 then
+          Sleep(aDelay)
+      end
+      else begin
+        aPrevVideoFrameTimestamp:=aFormat.TimeStamp;
+        aFirstVideoFrameTimestampMs:=aTimeStampMs;
+        //aFirstVideoFrameTimestamp:=aFormat.TimeStamp;
+      end;
+
+
+      //aLastVideoFrameTimestamp:=aFormat.TimeStamp;
+      aFirstVideoFrame:=false;
+    end
+    else if aFormat.biMediaType=mtAudio then
+    begin
+      //aLastAudioFrameTimestamp:=aFormat.TimeStamp;
+      if aFirstAudioFrame then
+      begin
+        aPrevAudioFrameTimestamp:=aFormat.TimeStamp;
+        aFirstAudioFrameTimestampMs:=aTimeStampMs;
+      end
+      else begin
+        if aFirstVideoFrame then //No video
+        begin
+          aCurrentTicks:=GetTickCount;
+          if aCurrentTicks<aStartTicks then //Страховка
+            break;
+
+          aTicks:=aCurrentTicks-aStartTicks; //Считаем сколько прошло мс реального времени от момента старта файла
+          aTimestampDeltaMs:=aTimeStampMs-aFirstAudioFrameTimestampMs;
+
+          if (aTimestampDeltaMs>aTicks) and (aTimestampDeltaMs-aTicks>10) then //10 мс оставляем на всякие задержки в процессе передачи
+            aDelay:=aTimestampDeltaMs-aTicks-10 //Вычитаем из расчетного времени реальное время. Дельта - величина, на сколько надо притормозить
+          else
+            aDelay:=0; //Мы не успеваем
+
+          //OutputDebugString(PChar(Format('TimeStamp: %d, Delay:%d',[aTimeStampMs,aDelay])));
+          Assert(aDelay>=0);
+          if aDelay>0 then
+            Sleep(aDelay)
+        end;
+      end;
+
+      aFirstAudioFrame:=false;
+    end;
+
+
+    if aFormat.biMediaType=mtVideo then
+    begin
+      Assert(aPrevVideoFrameTimestamp<>-1);
+      x:=aFormat.TimeStamp;
+      inc(FVideoTimeStampBase,aFormat.TimeStamp-aPrevVideoFrameTimestamp);
+      aFormat.TimeStamp:=FVideoTimeStampBase;
+      aPrevVideoFrameTimestamp:=x;
+    end
+    else begin
+      Assert(aPrevAudioFrameTimestamp<>-1);
+      x:=aFormat.TimeStamp;
+      inc(FAudioTimeStampBase,aFormat.TimeStamp-aPrevAudioFrameTimestamp);
+      aFormat.TimeStamp:=FAudioTimeStampBase;
+      aPrevAudioFrameTimestamp:=x;
+    end;
+
+
+    if FOwner<>nil then
+      FOwner.OnFrameReceived(aFormat,aData,aDataSize,aInfo,aInfoSize);
+  end;
+end;
+
+function TReadFileThread.StreamInfo: TBytes;
+begin
+  FOpenLock.Enter;
+  try
+    result:=FStreamInfo;
+  finally
+    FOpenLock.Leave;
+  end;
+end;
+
+procedure TReadFileThread.Execute;
+const
+  aMethodName = 'TReadFileThread.Execute;';
+begin
+  SetCurrentThreadName('Source: MediaServer.Stream.Source.File_.'+ClassName);
+
+  while not Terminated do
+  begin
+    try
+      ProcessFile;
+    except
+      on E:Exception do
+        WorkSpace.HandleException(self,E,aMethodName);
+    end;
+
+    if Assigned(FOwner.FOnFileFinished) then
+      FOwner.FOnFileFinished(FOwner,FOwner.FFileName);
+  end;
+end;
+
+{ TMediaServerSourceFile }
+
+constructor TMediaServerSourceFile.Create(const aFileName: string;aTransmitAudio: boolean);
+var
+  aParams: TMediaStreamDataSourceConnectParams_File;
+begin
+  aParams:=TMediaStreamDataSourceConnectParams_File.Create(aFileName,true,aTransmitAudio);
+  inherited Create(aParams, TMediaStreamDataSource_RTSP, aTransmitAudio, aDataReceiveTimeout);
+
+  FURL:=aURL;
+
+
+  FFileName:=aFileName;
+  FTransmitAudio:=aTransmitAudio;
+
+  FFramerClass:=GetFramerClassFromFileName(aFileName);
+  FFileReadThread:=TThreadObjectVar<TThread>.Create;
+  Assert(FFramerClass<>nil);
+
+  try
+    Open(true); //Попытаемся открыть сразу, потому что тогда мы сможем
+  except
+  end;
+end;
+
+destructor TMediaServerSourceFile.Destroy;
+begin
+  inherited;
+  FreeAndNil(FFileReadThread);
+end;
+
+function TMediaServerSourceFile.DeviceType: string;
+begin
+  result:='Файл';
+end;
+
+function TMediaServerSourceFile.Name: string;
+begin
+  result:=FFileName;
+end;
+
+procedure TMediaServerSourceFile.OnFrameReceived(
+                                  const aFormat: TMediaStreamDataHeader;
+                                  aData: pointer; aDataSize:cardinal;
+                                  aInfo: pointer; aInfoSize: cardinal);
+begin
+  //Если не нужно записывать аудио данные, то выходим
+  if not FTransmitAudio and (aFormat.biMediaType=mtAudio) then
+    exit;
+
+  //Выносим за Lock потому что все операнды - локальные переменные
+  DoDataReceived(aFormat, aData,aDataSize, aInfo,aInfoSize);
+end;
+
+procedure TMediaServerSourceFile.Open(aSync: boolean);
+begin
+  if Opened then
+    exit;
+
+  Close;
+
+  try
+    FFileReadThread.Value:=TReadFileThread.Create(FFileName,FFramerClass,self);
+    try
+      DoConnectionOK;
+    except
+       //?????
+    end;
+  except
+    on E:Exception do
+      DoConnectionFailed(E);
+  end;
+end;
+
+procedure TMediaServerSourceFile.DoClose;
+begin
+  FFileReadThread.FreeValue;
+end;
+
+function TMediaServerSourceFile.ConnectionString: string;
+begin
+  result:=MakeFileUrl(FFileName);
+end;
+
+function TMediaServerSourceFile.Opened: Boolean;
+begin
+  result:=FFileReadThread.Value<>nil;
+end;
+
+function TMediaServerSourceFile.StreamInfo: TBytes;
+begin
+  FFileReadThread.Lock;
+  try
+    CheckConnected;
+    result:=GetReadThread(FFileReadThread).StreamInfo;
+  finally
+    FFileReadThread.Unlock;
+  end;
+end;
+
+function TMediaServerSourceFile.GetStreamType(aMediaType: TMediaType): TStreamType;
+begin
+  FFileReadThread.Lock;
+  try
+    if Opened then
+    begin
+      if aMediaType=mtVideo then
+        result:=GetReadThread(FFileReadThread).FReader.VideoStreamType
+      else if aMediaType=mtAudio then
+        result:=GetReadThread(FFileReadThread).FReader.AudioStreamType
+      else
+        result:=0;
+    end
+    else begin
+      with FFramerClass.Create do
+      begin
+        if aMediaType=mtVideo then
+          result:=VideoStreamType
+        else if aMediaType=mtAudio then
+          result:=AudioStreamType
+        else
+          result:=0;
+        Free;
+      end;
+    end;
+  finally
+    FFileReadThread.Unlock;
+  end;
+end;
+
+function TMediaServerSourceFile.PtzSupported: boolean;
+begin
+  result:=false;
+end;
+
+procedure TMediaServerSourceFile.WaitWhileConnecting(aTimeout: integer);
+begin
+  inherited;
+end;
+
+{ TFileReader }
+
+constructor TFileReader.Create(const aFileName: string;
+  aFramerClass: TStreamFramerClass);
+begin
+  FStream:=TFileStream.Create(aFileName,fmOpenRead or fmShareDenyNone);
+  FFramer:=aFramerClass.Create;
+
+  //Эта команда нужна:
+  // 1. она позволяет нам получить формат файла
+  // 2. она позволяет нам убедиться, что поток валидного формата
+
+  FFramer.OpenStream(FStream);
+end;
+
+destructor TFileReader.Destroy;
+begin
+  FreeAndNil(FFramer);
+  FreeAndNil(FStream);
+  inherited;
+end;
+
+function TFileReader.GetNextFrame(
+  out aOutFormat: TMediaStreamDataHeader;
+  out aOutData: pointer; out aOutDataSize: cardinal;
+  out aOutInfo: pointer;
+  out aOutInfoSize: cardinal): boolean;
+begin
+  result:=FFramer.GetNextFrame(aOutFormat,aOutData,aOutDataSize,aOutInfo,aOutInfoSize);
+end;
+
+procedure TFileReader.Reset;
+begin
+  FStream.Position:=0;
+  FFramer.OpenStream(FStream); //Каждый раз заново открываем, потому что нужно сбросить позицию в потоке
+end;
+
+function TFileReader.StreamInfo: TBytes;
+begin
+  result:=FFramer.StreamInfo;
+end;
+
+function TFileReader.VideoStreamType: TStreamType;
+begin
+  result:=FFramer.VideoStreamType;
+end;
+
+function TFileReader.AudioStreamType: TStreamType;
+begin
+  result:=FFramer.AudioStreamType;
+end;
+
+
+end.
+

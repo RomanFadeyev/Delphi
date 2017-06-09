@@ -1,0 +1,250 @@
+{***********************************<_INFO>************************************}
+{  <Проект>      Медиа-сервер                                                  }
+{                                                                              }
+{  <Область>     16:Медиа-контроль                                             }
+{                                                                              }
+{  <Задача>      Медиа-источник, предоставляющий возможность объединять данные }
+{                из нескольких других источников                               }
+{                                                                              }
+{  <Автор>       Фадеев Р.В.                                                   }
+{                                                                              }
+{  <Дата>        14.01.2011                                                    }
+{                                                                              }
+{  <Примечание>  Нет примечаний.                                               }
+{                                                                              }
+{  <Атрибуты>    ООО НПП "Спецстрой-Связь", ООО "Трисофт"                      }
+{                                                                              }
+{***********************************</_INFO>***********************************}
+
+unit MediaServer.Stream.Source.InPointsMultiplexer;
+
+interface
+  uses Windows, SysUtils, Classes, SyncObjs, Types,
+  MediaServer.Stream.Source,
+  MediaProcessing.Definitions,MediaServer.Definitions, MediaServer.InPoint;
+
+type
+  //Класс, выполняющий непосредственно получение данных (видеопотока) из камеры
+  TMediaServerSourceInPointsMultiplexer = class (TMediaServerSource)
+  private
+    FInPoints: TMediaServerInPointArray;
+    FInPointSinks : array of IMediaStreamDataSink;
+    FOpened: boolean;
+
+    function GetInPoint(index: integer): TMediaServerInPoint;
+
+    procedure OnFrameReceived(const aFormat: TMediaStreamDataHeader;
+                              aData: pointer; aDataSize:cardinal;
+                              aInfo: pointer; aInfoSize: cardinal);
+  protected
+    function GetStreamType(aMediaType: TMediaType): TStreamType; override;
+  public
+    constructor Create(aInPoints: TMediaServerInPointArray); overload;
+    destructor Destroy; override;
+
+    procedure Open(aSync: boolean); override;
+    procedure DoClose; override;
+
+    procedure WaitWhileConnecting(aTimeout: integer); override;
+    function  Opened: Boolean; override;
+
+    function Name: string; override;
+    function DeviceType: string; override;
+    function ConnectionString: string; override;
+    function StreamInfo: TBytes; override;
+
+    function PtzSupported: boolean; override;
+
+    property InPoints[index: integer]: TMediaServerInPoint read GetInPoint;
+    function InPointCount: integer;
+
+    class function ParseConnectionString(const aConnectionString: string): TStringDynArray;
+  end;
+
+
+implementation
+  uses Math,Forms,MediaServer.Workspace,uTrace,uBaseUtils, MediaStream.FramerFactory;
+
+type
+  TMediaStreamDataSink = class (TInterfacedObject,IMediaStreamDataSink)
+  private
+    FOwner: TMediaServerSourceInPointsMultiplexer;
+    FInPoint:TMediaServerInPoint;
+    FChannel: integer;
+  public
+    constructor Create(aOwner: TMediaServerSourceInPointsMultiplexer; aInPoint:TMediaServerInPoint; aChannel: integer);
+    destructor Destroy; override;
+
+    procedure OnData(const aFormat: TMediaStreamDataHeader; aData: pointer; aDataSize: cardinal; aInfo: pointer; aInfoSize: cardinal);
+  end;
+
+{ TMediaServerSourceInPointsMultiplexer }
+
+constructor TMediaServerSourceInPointsMultiplexer.Create(aInPoints: TMediaServerInPointArray);
+var
+  i: Integer;
+begin
+  Create(-1);
+  //UsePrebuffer:=false;
+  FInPoints:=nil;//aInPoints;
+
+  SetLength(FInPointSinks,Length(FInPoints));
+
+  for i := 0 to High(FInPoints) do
+  begin
+    FInPointSinks[i]:=TMediaStreamDataSink.Create(self,aInPoints[i],i);
+    FInPoints[i].DataSinks.AddSink(FInPointSinks[i]);
+  end;
+
+end;
+
+destructor TMediaServerSourceInPointsMultiplexer.Destroy;
+begin
+  inherited;
+  FInPoints:=nil;
+  FInPointSinks:=nil;
+end;
+
+function TMediaServerSourceInPointsMultiplexer.DeviceType: string;
+begin
+  result:='Мультиплексор';
+end;
+
+function TMediaServerSourceInPointsMultiplexer.Name: string;
+begin
+  result:='Input Point Multiplexer';
+end;
+
+procedure TMediaServerSourceInPointsMultiplexer.OnFrameReceived(
+                                  const aFormat: TMediaStreamDataHeader;
+                                  aData: pointer; aDataSize:cardinal;
+
+                                  aInfo: pointer; aInfoSize: cardinal);
+begin
+  //DoDataReceived(aFormat, aData,aDataSize, aInfo,aInfoSize);
+end;
+
+procedure TMediaServerSourceInPointsMultiplexer.Open(aSync: boolean);
+var
+  I: Integer;
+begin
+  if Opened then
+    exit;
+
+
+  for I := 0 to High(FInPoints) do
+    FInPoints[i].Open(aSync);
+
+
+  FOpened:=true;
+
+  if Assigned(OnConnectionOk) then
+    OnConnectionOk(self);
+end;
+
+procedure TMediaServerSourceInPointsMultiplexer.DoClose;
+begin
+  FOpened:=false;
+end;
+
+function TMediaServerSourceInPointsMultiplexer.GetInPoint(index: integer): TMediaServerInPoint;
+begin
+  result:=FInPoints[index];
+end;
+
+function TMediaServerSourceInPointsMultiplexer.InPointCount: integer;
+begin
+  result:=Length(FInPoints);
+end;
+
+function TMediaServerSourceInPointsMultiplexer.GetStreamType(aMediaType: TMediaType): TStreamType;
+begin
+  result:=0;
+  if Length(FInPoints)>0 then
+    result:=FInPoints[0].StreamTypes[aMediaType];
+end;
+
+function TMediaServerSourceInPointsMultiplexer.ConnectionString: string;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FInPoints) do
+    result:=result+FInPoints[i].Name+'; ';
+
+  if result<>'' then
+    SetLength(Result,Length(result)-2);
+end;
+
+function TMediaServerSourceInPointsMultiplexer.Opened: Boolean;
+begin
+  result:=FOpened;
+end;
+
+function TMediaServerSourceInPointsMultiplexer.StreamInfo: TBytes;
+begin
+  result:=nil;
+end;
+
+class function TMediaServerSourceInPointsMultiplexer.ParseConnectionString(const aConnectionString: string): TStringDynArray;
+var
+  aList: TStringList;
+  i: Integer;
+begin
+  aList:=TStringList.Create;
+  try
+    fsiBaseUtils.SplitString(aConnectionString,aList,';');
+
+    SetLength(result,aList.Count);
+    for i := 0 to aList.Count - 1 do
+      result[i]:=aList[i];
+  finally
+    aList.Free;
+  end;
+
+end;
+
+function TMediaServerSourceInPointsMultiplexer.PtzSupported: boolean;
+begin
+  result:=false;
+end;
+
+procedure TMediaServerSourceInPointsMultiplexer.WaitWhileConnecting(aTimeout: integer);
+begin
+  inherited;
+  //TODO ждать всех или нет?
+end;
+
+
+{ TMediaStreamDataSink }
+
+constructor TMediaStreamDataSink.Create(aOwner: TMediaServerSourceInPointsMultiplexer; aInPoint: TMediaServerInPoint; aChannel: integer);
+begin
+  inherited Create;
+  FOwner:=aOwner;
+  FInPoint:=aInPoint;
+  FChannel:=aChannel;
+end;
+
+destructor TMediaStreamDataSink.Destroy;
+begin
+  FOwner:=nil;
+  FInPoint:=nil;
+  inherited;
+end;
+
+procedure TMediaStreamDataSink.OnData(const aFormat: TMediaStreamDataHeader; aData: pointer; aDataSize: cardinal; aInfo: pointer; aInfoSize: cardinal);
+var
+  aFormat2: TMediaStreamDataHeader;
+begin
+  if FOwner<>nil then
+    if FInPoint<>nil then
+    begin
+      aFormat2:=aFormat;
+      aFormat2.Channel:=FChannel;
+      if FOwner.FOpened then
+        FOwner.OnFrameReceived(aFormat2,aData,aDataSize,aInfo,aInfoSize);
+    end;
+end;
+
+end.
+
